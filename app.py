@@ -27,6 +27,9 @@ app = FastAPI()
 
 
 def get_conn():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     with open(SCHEMA_PATH, "r") as f:
         conn.executescript(f.read())
@@ -94,33 +97,36 @@ async def webhook(request: Request):
 
     analysis, error = analyze_with_claude(payload)
 
-    conn = get_conn()
-    conn.execute(
-        """INSERT INTO entries
-           (received_at, signal_time, direction, setup_tag, symbol, entry_price, sl, tp,
-            atr, ema_distance_atr, regime_slope_pct, sweep_age_bars, session,
-            raw_payload, llm_model, llm_analysis, llm_error)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (
-            datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            payload.get("signal_time"),
-            payload.get("direction"),
-            payload.get("setup_tag"),
-            payload.get("symbol"),
-            payload.get("entry_price"),
-            payload.get("sl"),
-            payload.get("tp"),
-            payload.get("atr"),
-            payload.get("ema_distance_atr"),
-            payload.get("regime_slope_pct"),
-            payload.get("sweep_age_bars"),
-            payload.get("session"),
-            raw.decode("utf-8", errors="replace"),
-            CLAUDE_MODEL if analysis else None,
-            analysis,
-            error,
-        ),
-    )
+    try:
+        conn = get_conn()
+        conn.execute(
+            """INSERT INTO entries
+               (received_at, signal_time, direction, setup_tag, symbol, entry_price, sl, tp,
+                atr, ema_distance_atr, regime_slope_pct, sweep_age_bars, session,
+                raw_payload, llm_model, llm_analysis, llm_error)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                payload.get("signal_time"),
+                payload.get("direction"),
+                payload.get("setup_tag"),
+                payload.get("symbol"),
+                payload.get("entry_price"),
+                payload.get("sl"),
+                payload.get("tp"),
+                payload.get("atr"),
+                payload.get("ema_distance_atr"),
+                payload.get("regime_slope_pct"),
+                payload.get("sweep_age_bars"),
+                payload.get("session"),
+                raw.decode("utf-8", errors="replace"),
+                CLAUDE_MODEL if analysis else None,
+                analysis,
+                error,
+            ),
+        )
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"db write failed: {e}", "db_path": DB_PATH}, status_code=500)
     conn.commit()
     conn.close()
     return {"ok": True}
