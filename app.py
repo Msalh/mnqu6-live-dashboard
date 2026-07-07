@@ -5,13 +5,29 @@ Receives three event types from TradingView on one webhook, all correlated by
 "correlation_id" (the entry bar's timestamp, unique per trade since only one
 position is open at a time):
 
-  - "entry":        a new signal fired. Stored, analyzed by Claude, and the
-                     order-placement fields are forwarded to PickMyTrade.
+  - "entry":        a new signal fired. The order-placement fields are forwarded
+                     to PickMyTrade FIRST (order relay must never wait on Claude),
+                     then stored, then Claude analysis runs as a background task
+                     that updates the row afterward. Idempotent: if this
+                     correlation_id was already successfully forwarded, this is a
+                     no-op (protects against TradingView webhook retries causing a
+                     duplicate real order).
   - "price_update": periodic update for an open position (current price,
-                     unrealized P&L). Never forwarded anywhere.
+                     unrealized P&L). Never forwarded anywhere. Never touches the
+                     pmt_forwarded/pmt_status_code/pmt_error columns.
   - "exit":         the position closed (win or loss). Never forwarded -
                      PickMyTrade already executes its own bracket exit
-                     independently once it has the entry order.
+                     independently once it has the entry order. Never touches the
+                     pmt_forwarded/pmt_status_code/pmt_error columns.
+
+Response status codes on POST /webhook (all in the 2xx range so TradingView never
+interprets a partial failure as a delivery failure and retries it, which would
+risk a duplicate order on top of the original problem):
+  - 200: fully normal (entry forwarded OK, or a price_update/exit applied OK)
+  - 207: entry was stored, but the PickMyTrade forward failed or is unconfigured -
+         check pmt_error. This is deliberately NOT hidden as a plain 200.
+  - 208: duplicate entry - this correlation_id was already forwarded previously,
+         nothing was re-sent to PickMyTrade, the existing record is untouched.
 
 Run locally:
     uvicorn app:app --reload
@@ -24,7 +40,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 DB_PATH = os.environ.get("LIVE_DB_PATH", os.path.join(os.path.dirname(__file__), "live.db"))
@@ -118,8 +134,66 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def get_pmt_forwarded(conn, correlation_id):
+    """Returns True/False/None (None = no row exists yet for this correlation_id)."""
+    row = conn.execute("SELECT pmt_forwarded FROM trades WHERE correlation_id=?", (correlation_id,)).fetchone()
+    return bool(row[0]) if row else None
+
+
+def store_entry(conn, correlation_id, payload, raw_body, forwarded, pmt_status, pmt_error):
+    """Insert a new entry row, or refresh an existing one from a prior FAILED forward attempt
+    (never called when pmt_forwarded is already True - the caller checks that first). Deliberately
+    does not touch status/current_price/exit_price/llm_* columns on conflict, so a retry of a
+    previously-failed entry can't clobber later lifecycle data that (in practice) shouldn't exist
+    yet anyway, but this keeps the guarantee explicit rather than accidental."""
+    conn.execute(
+        """INSERT INTO trades
+           (correlation_id, received_at, signal_time, direction, setup_tag, symbol,
+            entry_price, sl, tp, atr, ema_distance_atr, regime_slope_pct, sweep_age_bars,
+            session, status, pmt_forwarded, pmt_status_code, pmt_error, raw_entry_payload)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?, ?)
+           ON CONFLICT(correlation_id) DO UPDATE SET
+             received_at=excluded.received_at, signal_time=excluded.signal_time,
+             direction=excluded.direction, setup_tag=excluded.setup_tag, symbol=excluded.symbol,
+             entry_price=excluded.entry_price, sl=excluded.sl, tp=excluded.tp, atr=excluded.atr,
+             ema_distance_atr=excluded.ema_distance_atr, regime_slope_pct=excluded.regime_slope_pct,
+             sweep_age_bars=excluded.sweep_age_bars, session=excluded.session,
+             pmt_forwarded=excluded.pmt_forwarded, pmt_status_code=excluded.pmt_status_code,
+             pmt_error=excluded.pmt_error, raw_entry_payload=excluded.raw_entry_payload""",
+        (
+            correlation_id, now_iso(), payload.get("signal_time"),
+            payload.get("direction"), payload.get("setup_tag"), payload.get("symbol"),
+            payload.get("entry_price"), payload.get("sl"), payload.get("tp"),
+            payload.get("atr"), payload.get("ema_distance_atr"), payload.get("regime_slope_pct"),
+            payload.get("sweep_age_bars"), payload.get("session"),
+            int(forwarded), pmt_status, pmt_error, raw_body,
+        ),
+    )
+
+
+def run_claude_analysis(payload, correlation_id):
+    """Background task - runs AFTER the HTTP response is already sent. Commentary only;
+    never touches pmt_forwarded/pmt_status_code/pmt_error. Defensive at the outermost level
+    (not just relying on analyze_with_claude's own try/except) so nothing from this task can
+    ever propagate into the background task runner, regardless of what fails."""
+    try:
+        analysis, llm_error = analyze_with_claude(payload)
+    except Exception as e:
+        analysis, llm_error = None, str(e)
+    try:
+        conn = get_conn()
+        conn.execute(
+            "UPDATE trades SET llm_model=?, llm_analysis=?, llm_error=? WHERE correlation_id=?",
+            (CLAUDE_MODEL if analysis else None, analysis, llm_error, correlation_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # analysis is commentary only - never let a DB hiccup here surface as an error
+
+
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(request: Request, background_tasks: BackgroundTasks):
     raw = await request.body()
     try:
         payload = json.loads(raw)
@@ -136,44 +210,62 @@ async def webhook(request: Request):
 
     try:
         conn = get_conn()
+
         if event_type == "entry":
-            analysis, llm_error = analyze_with_claude(payload)
+            already_forwarded = get_pmt_forwarded(conn, correlation_id)
+            if already_forwarded:
+                # Idempotency guard: this is a retry (TradingView redelivery, etc.) of a signal
+                # that already placed a real order. Do NOT forward again. Do NOT touch the
+                # existing record. Acknowledge so TradingView doesn't keep retrying.
+                conn.close()
+                return JSONResponse(
+                    {"ok": True, "duplicate_already_forwarded": True, "correlation_id": correlation_id},
+                    status_code=208,
+                )
+
+            # Order relay first, always - Claude must never delay a real order.
             forwarded, pmt_status, pmt_error = forward_to_pickmytrade(payload)
-            conn.execute(
-                """INSERT OR REPLACE INTO trades
-                   (correlation_id, received_at, signal_time, direction, setup_tag, symbol,
-                    entry_price, sl, tp, atr, ema_distance_atr, regime_slope_pct, sweep_age_bars,
-                    session, status, llm_model, llm_analysis, llm_error,
-                    pmt_forwarded, pmt_status_code, pmt_error, raw_entry_payload)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?, ?,?,?, ?)""",
-                (
-                    correlation_id, now_iso(), payload.get("signal_time"),
-                    payload.get("direction"), payload.get("setup_tag"), payload.get("symbol"),
-                    payload.get("entry_price"), payload.get("sl"), payload.get("tp"),
-                    payload.get("atr"), payload.get("ema_distance_atr"), payload.get("regime_slope_pct"),
-                    payload.get("sweep_age_bars"), payload.get("session"),
-                    CLAUDE_MODEL if analysis else None, analysis, llm_error,
-                    int(forwarded), pmt_status, pmt_error, raw.decode("utf-8", errors="replace"),
-                ),
+
+            store_entry(conn, correlation_id, payload, raw.decode("utf-8", errors="replace"),
+                        forwarded, pmt_status, pmt_error)
+            conn.commit()
+            conn.close()
+
+            # Claude runs after the response-critical work is done and does not block this
+            # request at all - it's a background task, not part of the synchronous path.
+            background_tasks.add_task(run_claude_analysis, payload, correlation_id)
+
+            status_code = 200 if forwarded else 207
+            return JSONResponse(
+                {"ok": True, "pmt_forwarded": forwarded, "pmt_status_code": pmt_status, "pmt_error": pmt_error},
+                status_code=status_code,
             )
+
         elif event_type == "price_update":
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE trades SET current_price=?, unrealized_pnl=?, last_update_at=? WHERE correlation_id=?",
                 (payload.get("current_price"), payload.get("unrealized_pnl"), now_iso(), correlation_id),
             )
+            matched = cur.rowcount
         elif event_type == "exit":
             status = "won" if str(payload.get("outcome", "")).upper() == "WIN" else "lost"
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE trades SET status=?, exit_price=?, realized_pnl=?, closed_at=? WHERE correlation_id=?",
                 (status, payload.get("exit_price"), payload.get("realized_pnl"), now_iso(), correlation_id),
             )
+            matched = cur.rowcount
         else:
+            conn.close()
             return JSONResponse({"ok": False, "error": f"unknown type: {event_type}"}, status_code=400)
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"db error: {e}", "db_path": DB_PATH}, status_code=500)
 
     conn.commit()
     conn.close()
+    if matched == 0:
+        return JSONResponse(
+            {"ok": True, "warning": f"no trade found for correlation_id {correlation_id}"}, status_code=200
+        )
     return {"ok": True}
 
 
